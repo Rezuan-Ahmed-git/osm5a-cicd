@@ -1,0 +1,116 @@
+name: CI/CD Pipeline
+
+on:
+    push:
+        branches:
+            - main
+
+jobs:
+    test:
+        name: Test Job
+        runs-on: self-hosted
+
+        steps:
+            - name: Checkout Code
+              uses: actions/checkout@v4
+
+            - name: Setup Node.js v22
+              uses: actions/setup-node@v4
+              with:
+                  node-version: "22"
+
+            - name: Install Dependencies
+              run: npm install
+
+            - name: Run Tests & Capture Results
+              run: npm run check 2>&1 | tee test-results.txt
+
+            - name: Upload Test Results Artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: test-results
+                  path: test-results.txt
+
+    deploy:
+        name: Deploy Job
+        runs-on: self-hosted
+        needs: test
+
+        steps:
+            - name: Download Test Results Artifact
+              uses: actions/download-artifact@v4
+              with:
+                  name: test-results
+
+            - name: Display Test Results
+              run: cat test-results.txt
+
+            - name: SSH into Deployment Server & Deploy
+              uses: appleboy/ssh-action@v1.0.3
+              with:
+                  host: ${{ secrets.EC2_HOST }}
+                  username: ${{ secrets.EC2_USER }}
+                  key: ${{ secrets.EC2_SSH_KEY }}
+                  script: |
+                      # ─── Install Node.js v22 if not present ───
+                      if ! node -v 2>/dev/null | grep -q "v22"; then
+                        curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+                        sudo apt install -y nodejs
+                      fi
+                      echo "Node version: $(node -v)"
+
+                      # ─── Install PM2 if not present ───
+                      if ! command -v pm2 &> /dev/null; then
+                        sudo npm install -g pm2
+                      fi
+                      echo "PM2 version: $(pm2 -v)"
+
+                      # ─── Install Nginx if not present ───
+                      if ! command -v nginx &> /dev/null; then
+                        sudo apt install -y nginx
+                        sudo systemctl enable nginx
+                        sudo systemctl start nginx
+                      fi
+                      echo "Nginx version: $(nginx -v)"
+
+                      # ─── Pull or Clone the app ───
+                      APP_DIR=~/app/node-express-app
+
+                      if [ -d "$APP_DIR/.git" ]; then
+                        echo "Repo exists, pulling latest..."
+                        cd $APP_DIR
+                        git pull origin main
+                      else
+                        echo "Cloning repo..."
+                        mkdir -p ~/app
+                        git clone https://github.com/${{ github.repository }} $APP_DIR
+                        cd $APP_DIR
+                      fi
+
+                      # ─── Install app dependencies ───
+                      npm install --production
+
+                      # ─── Configure Nginx reverse proxy ───
+                      sudo bash -c 'cat > /etc/nginx/sites-available/default <<EOF
+                      server {
+                          listen 80;
+                          server_name _;
+
+                          location / {
+                              proxy_pass http://localhost:3000;
+                              proxy_http_version 1.1;
+                              proxy_set_header Upgrade \$http_upgrade;
+                              proxy_set_header Connection "upgrade";
+                              proxy_set_header Host \$host;
+                              proxy_cache_bypass \$http_upgrade;
+                          }
+                      }
+                      EOF'
+                      sudo nginx -t && sudo systemctl restart nginx
+
+                      # ─── Deploy with PM2 ───
+                      pm2 stop node-express-app || true
+                      pm2 delete node-express-app || true
+                      pm2 start src/server.js --name node-express-app
+                      pm2 save
+                      pm2 status
